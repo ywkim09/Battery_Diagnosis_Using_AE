@@ -1,0 +1,3 @@
+ml Miniconda3
+conda activate battery_ae
+# Battery_Diagnosis_Using_AE
