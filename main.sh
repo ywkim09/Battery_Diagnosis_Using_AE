@@ -2,7 +2,7 @@
 #SBATCH -A uppmax2026-1-226
 #SBATCH -p pelle            # 혹은 이 줄을 아예 삭제해도 pelle가 기본값으로 적용됩니다.
 #SBATCH -c 4                # Pelle 문서 권장: 멀티코어 지정 시 -c 사용
-#SBATCH -t 00:30:00
+#SBATCH -t 00:50:00
 #SBATCH -J my_task
 #SBATCH -o logs/slurm-%j.out
 #SBATCH -e logs/slurm-%j.err

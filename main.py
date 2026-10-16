@@ -10,11 +10,11 @@ import os, datetime
 import time
 from pathlib import Path
 import pickle
-
 import matplotlib
 
 matplotlib.use("Agg")
 
+import matplotlib.patches as mpatches  
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 import numpy as np
@@ -31,7 +31,7 @@ time_threshold = 0.00005
 N = 500
 method = 'wavelet'
 
-FIGURE_DIR = Path("result/figures")
+FIGURE_DIR = os.path.join('result', datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')) 
 
 cluster_folders = {
     "gassing": Path("Data/260928/Cluster_0 (gassing)"),
@@ -56,8 +56,8 @@ def log(msg):
 
 
 def save_current_figure(name):
-    FIGURE_DIR.mkdir(parents=True, exist_ok=True)
-    plt.savefig(FIGURE_DIR / name, dpi=150)
+    os.makedirs(FIGURE_DIR, exist_ok=True)
+    plt.savefig(os.path.join(FIGURE_DIR, name) , dpi=150)
     plt.close()
 
 
@@ -669,13 +669,13 @@ def classify_segments(models, magnitude_input_dict, keys_dict, cluster):
         key = keys_dict[cluster][i]
         for m in MODEL_LST:
             prob_dict[m][key] = []
-            entropy_dict[m][key] = []
+            entropy_dict[m][key] = None
         for spectrum in magnitude_array:
             spectrum = np.array(spectrum).reshape(1, -1)
             for m in MODEL_LST:
                 probs = models[m].predict_proba(spectrum)[0]
                 prob_dict[m][key].append(probs)
-                entropy_dict[m][key].append(entropy(probs, base=2))
+                entropy_dict[m][key] = entropy(probs, base=2)
         for m in MODEL_LST:
             result_dict[m][key] = np.array(prob_dict[m][key]).argmax(axis=1)
     return result_dict, prob_dict, entropy_dict
@@ -687,30 +687,36 @@ def plot_classification_regions(key, model, result_dict, entropy_dict, cluster_d
     time_arr = df['Time (s)'].values
     amp_arr = df['Amplitude (V)'].values
 
-    ax.plot(time_arr, amp_arr, color='black', linewidth=0.8, alpha=0.7, label='AE Signal')
+    signal_line = ax.plot(time_arr, amp_arr, color='black', linewidth=0.8, alpha=0.7, label='AE Signal')
 
     color_map = {0: 'green', 1: 'orange', 2: 'red'}
     label_map = {0: 'Normal (0)', 1: 'Gassing (1)', 2: 'Cracking (2)'}
     used_labels = set()
-    for idx, cls_id in enumerate(result_dict):
-        j = idx * N
+    
+    cls_id = result_dict[1]
 
-        t_start = time_arr[j]
-        t_end = time_arr[j + N - 1] if (j + N - 1) < len(time_arr) else time_arr[-1]
+    t_start = time_arr[N]
+    t_end = time_arr[N + N - 1] 
 
-        color = color_map.get(cls_id, 'gray')
-        label = label_map.get(cls_id, f'Class {cls_id}') if cls_id not in used_labels else None
+    color = color_map.get(cls_id, 'gray')
+    label = label_map.get(cls_id, f'Class {cls_id}') if cls_id not in used_labels else None
 
-        ax.axvspan(t_start, t_end, color=color, alpha=0.25, edgecolor='none', label=label)
-        used_labels.add(cls_id)
-
+    ax.axvspan(t_start, t_end, color=color, alpha=0.25, edgecolor='none', label=label)
+    used_labels.add(cls_id)
+    legend_patches = [
+        mpatches.Patch(color=color_map[0], alpha=0.25, label=label_map[0]),
+        mpatches.Patch(color=color_map[1], alpha=0.25, label=label_map[1]),
+        mpatches.Patch(color=color_map[2], alpha=0.25, label=label_map[2])
+    ]
+    handles = signal_line + legend_patches  
     ax.set_xlim(0.0, 0.00005*6)
     ax.set_ylim(-0.08, 0.08)
     ax.set_xlabel('Time (s)', fontsize=12)
     ax.set_ylabel('Amplitude (V)', fontsize=12)
-    ax.set_title(f'{key} (Window = {N}, Strid = {N}, Entropy = {entropy_dict}', fontsize=14)
+    ax.set_title(f'{key} (Window = {N}, Strid = {N}, Entropy = {entropy_dict:.3f}', fontsize=14)
     ax.grid(True, linestyle='--', alpha=0.5)
-    ax.legend(loc='upper right')
+    ax.legend(handles=handles, loc='upper right')
+    # ax.legend(loc='upper right')
     if save:   
         path_dir = os.path.join(path, model, str(result_dict[1])) 
         os.makedirs(path_dir, exist_ok=True)
@@ -789,35 +795,35 @@ def main():
 
     # ARMA model
     log(f"[6/9] Training AR({AR_ORDER}) model")
+    path_test = os.path.join(FIGURE_DIR, 'test') 
     ar_y_test, ar_log_likelihoods, test_sequences, test_filekeys, full_sequences = run_ar_model(
         signal_data, cluster_data, sample_key_to_index, train_idx, valid_idx, test_idx
     )
-    path_default = os.path.join('result', datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')) 
-    save_figs('ARMA', ar_y_test, ar_log_likelihoods, full_sequences, test_filekeys, path_default)
+    save_figs('ARMA', ar_y_test, ar_log_likelihoods, full_sequences, test_filekeys, path_test)
 
     # Gaussian NB
     log("[7/9] Training Gaussian NB")
     model = train_gaussian_nb(X_train, y_train, X_test, y_test, confirmed_classes, y, sample_keys, train_idx, test_idx)
-    save_figs('GNB', y_test, model.predict_proba(X_test), full_sequences, test_filekeys, path_default)
+    save_figs('GNB', y_test, model.predict_proba(X_test), full_sequences, test_filekeys, path_test)
 
     # XGBoost
     log("[8/9] Training XGBoost")
     xgb_model = train_xgboost(X_train, y_train, X_valid, y_valid, X_test, y_test, confirmed_classes)
-    save_figs('XGB', y_test, xgb_model.predict_proba(X_test), full_sequences, test_filekeys, path_default)
+    save_figs('XGB', y_test, xgb_model.predict_proba(X_test), full_sequences, test_filekeys, path_test)
 
     models = {"GaussNB": model, "XGBoost": xgb_model}
-    path_model = os.path.join(path_default, 'models', 'data.pkl') 
+    path_model = os.path.join(FIGURE_DIR, 'models', 'data.pkl') 
     os.makedirs(os.path.dirname(path_model), exist_ok=True)
     pickle.dump(models, open(path_model, 'wb'))
 
 
     # Mixed cluster
     log("[9/9] Classifying 'mixed' cluster")
-    result_dict, prob_dict = classify_segments(models, magnitude_input_dict, keys_dict, 'mixed')
+    result_dict, prob_dict, entropy_dict = classify_segments(models, magnitude_input_dict, keys_dict, 'mixed')
     k = keys_dict['mixed'][9]
-    path_mixed = os.path.join(path_default, 'mixed') 
+    path_mixed = os.path.join(FIGURE_DIR, 'mixed') 
     for m in MODEL_LST:
-        plot_classification_regions(k, m, result_dict[m][k], cluster_data["mixed"][k], path_mixed, N, save = True)
+        plot_classification_regions(k, m, result_dict[m][k], entropy_dict[m][k], cluster_data["mixed"][k], path_mixed, N, save = True)
 
     # -----------------------------------------------------------------------
     # Unlabeled test data
@@ -835,12 +841,12 @@ def main():
 
     test_keys = keys_dict['test']
     log(f"[Unlabeled 4/4] Saving classification plots for {len(test_keys)} files")
-    path_test = os.path.join(path_default, 'test') 
+    path_drift = os.path.join(FIGURE_DIR, 'drift') 
     for idx, k in enumerate(test_keys, 1):
         if idx % 50 == 0 or idx == len(test_keys):
             log(f"  {idx}/{len(test_keys)} files plotted")
         for m in MODEL_LST:
-            plot_classification_regions(k, m, result_dict[m][k], entropy_dict[m][k], cluster_data["test"][k], path_test, N, save=True)
+            plot_classification_regions(k, m, result_dict[m][k], entropy_dict[m][k], cluster_data["test"][k], path_drift, N, save=True)
 
 
 if __name__ == "__main__":
