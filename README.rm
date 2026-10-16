@@ -2,8 +2,10 @@ ml Miniconda3
 conda activate battery_ae
 # Battery_Diagnosis_Using_AE
 
-interactive -A uppmax2026-1-226 -t 2:00:00 -n 4
+interactive -A uppmax2026-1-226 -t 0:30:00 -n 4
 module load Miniconda3/25.7.0-2
+source $(conda info --base)/etc/profile.d/conda.sh
+conda activate ./mini_env
 ml JupyterLab/4.4.9-GCCcore-14.3.0
 source .venv/bin/activate
 jupyter lab --ip 0.0.0.0 --no-browser

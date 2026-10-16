@@ -6,7 +6,7 @@ applies the trained models to an unlabeled test folder.
 
 Figures that the notebook displayed inline are saved to result/figures/.
 """
-import os
+import os, datetime
 import time
 from pathlib import Path
 import pickle
@@ -25,6 +25,7 @@ from sklearn.metrics import accuracy_score, classification_report, confusion_mat
 from sklearn.model_selection import train_test_split
 from sklearn.naive_bayes import GaussianNB
 from xgboost import XGBClassifier
+from scipy.stats import entropy
 
 time_threshold = 0.00005
 N = 500
@@ -631,7 +632,7 @@ def train_xgboost(X_train, y_train, X_valid, y_valid, X_test, y_test, confirmed_
     early_stopping_rounds=30, 
     subsample=0.8,
     colsample_bytree=0.8,
-    reg_alpha=1,           
+    reg_alpha=2,           
     reg_lambda=1,        
     eval_metric="mlogloss",
     random_state=42,
@@ -641,7 +642,7 @@ def train_xgboost(X_train, y_train, X_valid, y_valid, X_test, y_test, confirmed_
     xgb_model.fit(
     X_train, 
     y_train,
-    eval_set=[(X_valid, y_valid)], # 검증 데이터로 조기 종료 판단
+    eval_set=[(X_valid, y_valid)],
     verbose=False
     )
 
@@ -659,25 +660,28 @@ def train_xgboost(X_train, y_train, X_valid, y_valid, X_test, y_test, confirmed_
 def classify_segments(models, magnitude_input_dict, keys_dict, cluster):
     result_dict = {}
     prob_dict = {}
+    entropy_dict = {}
     for m in MODEL_LST:
         result_dict[m] = {}
         prob_dict[m] = {}
+        entropy_dict[m] = {}
     for i, magnitude_array in enumerate(magnitude_input_dict[cluster]):
         key = keys_dict[cluster][i]
         for m in MODEL_LST:
             prob_dict[m][key] = []
-
+            entropy_dict[m][key] = []
         for spectrum in magnitude_array:
             spectrum = np.array(spectrum).reshape(1, -1)
             for m in MODEL_LST:
-                prob_dict[m][key].append(models[m].predict_proba(spectrum)[0])
-
+                probs = models[m].predict_proba(spectrum)[0]
+                prob_dict[m][key].append(probs)
+                entropy_dict[m][key].append(entropy(probs, base=2))
         for m in MODEL_LST:
             result_dict[m][key] = np.array(prob_dict[m][key]).argmax(axis=1)
-    return result_dict, prob_dict
+    return result_dict, prob_dict, entropy_dict
 
 
-def plot_classification_regions(key, model, result_dict, cluster_data, path, N, save = False):
+def plot_classification_regions(key, model, result_dict, entropy_dict, cluster_data, path, N, save = False):
     fig, ax = plt.subplots(1, 1, figsize=(8, 4))
     df = cluster_data
     time_arr = df['Time (s)'].values
@@ -704,7 +708,7 @@ def plot_classification_regions(key, model, result_dict, cluster_data, path, N, 
     ax.set_ylim(-0.08, 0.08)
     ax.set_xlabel('Time (s)', fontsize=12)
     ax.set_ylabel('Amplitude (V)', fontsize=12)
-    ax.set_title(f'Classification Regions (Window = {N} and Strid = {N}) for {key}', fontsize=14)
+    ax.set_title(f'{key} (Window = {N}, Strid = {N}, Entropy = {entropy_dict}', fontsize=14)
     ax.grid(True, linestyle='--', alpha=0.5)
     ax.legend(loc='upper right')
     if save:   
@@ -788,7 +792,7 @@ def main():
     ar_y_test, ar_log_likelihoods, test_sequences, test_filekeys, full_sequences = run_ar_model(
         signal_data, cluster_data, sample_key_to_index, train_idx, valid_idx, test_idx
     )
-    path_default = os.path.join('result') 
+    path_default = os.path.join('result', datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')) 
     save_figs('ARMA', ar_y_test, ar_log_likelihoods, full_sequences, test_filekeys, path_default)
 
     # Gaussian NB
@@ -802,7 +806,7 @@ def main():
     save_figs('XGB', y_test, xgb_model.predict_proba(X_test), full_sequences, test_filekeys, path_default)
 
     models = {"GaussNB": model, "XGBoost": xgb_model}
-    path_model = os.path.join('result', 'models', 'data.pkl') 
+    path_model = os.path.join(path_default, 'models', 'data.pkl') 
     os.makedirs(os.path.dirname(path_model), exist_ok=True)
     pickle.dump(models, open(path_model, 'wb'))
 
@@ -811,7 +815,7 @@ def main():
     log("[9/9] Classifying 'mixed' cluster")
     result_dict, prob_dict = classify_segments(models, magnitude_input_dict, keys_dict, 'mixed')
     k = keys_dict['mixed'][9]
-    path_mixed = os.path.join('result', 'mixed') 
+    path_mixed = os.path.join(path_default, 'mixed') 
     for m in MODEL_LST:
         plot_classification_regions(k, m, result_dict[m][k], cluster_data["mixed"][k], path_mixed, N, save = True)
 
@@ -819,7 +823,6 @@ def main():
     # Unlabeled test data
     # -----------------------------------------------------------------------
     log("[Unlabeled 1/4] Loading unlabeled test data")
-    del noise_data, freq_dict, magnitude_dict, magnitude_input_dict
     cluster_data = load_clusters(unlabeled_folders)
     signal_data = process_unlabeled_data(cluster_data, N)
 
@@ -828,16 +831,16 @@ def main():
     magnitude_input_dict = select_features(magnitude_dict, method, p90_point)
 
     log("[Unlabeled 3/4] Classifying segments")
-    result_dict, prob_dict = classify_segments(models, magnitude_input_dict, keys_dict, 'test')
+    result_dict, prob_dict, entropy_dict = classify_segments(models, magnitude_input_dict, keys_dict, 'test')
 
     test_keys = keys_dict['test']
     log(f"[Unlabeled 4/4] Saving classification plots for {len(test_keys)} files")
-    path_test = os.path.join('result', 'test') 
+    path_test = os.path.join(path_default, 'test') 
     for idx, k in enumerate(test_keys, 1):
         if idx % 50 == 0 or idx == len(test_keys):
             log(f"  {idx}/{len(test_keys)} files plotted")
         for m in MODEL_LST:
-            plot_classification_regions(k, m, result_dict[m][k], cluster_data["test"][k], path_test, N, save=True)
+            plot_classification_regions(k, m, result_dict[m][k], entropy_dict[m][k], cluster_data["test"][k], path_test, N, save=True)
 
 
 if __name__ == "__main__":
