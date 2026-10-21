@@ -31,8 +31,11 @@ from scipy.stats import entropy
 time_threshold = 0.00005
 N = 500
 method = 'wavelet'
-pulse_detection = True
-aic = True
+PULSE_DETECTION_BOOL = True
+AIC_BOOL = True
+AIC_ENVELOPE_THRESHOLD = 0.2
+AIC_SEARCH_HALF_WINDOW = 500
+VOLTAGE_THRESHOLD = 0.02
 
 FIGURE_DIR = os.path.join('result', datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')) 
 
@@ -63,27 +66,61 @@ def save_current_figure(name):
     plt.savefig(os.path.join(FIGURE_DIR, name) , dpi=150)
     plt.close()
 
-def onset_picker(signal):
-    voltage_threshold = 0.02
+def onset_anchor_index(signal, time_values=None):
     signal = np.asarray(signal, dtype=float)
-    above = np.flatnonzero(np.abs(signal) >= voltage_threshold)
-    if len(above) == 0:
-        raise ValueError(
-            f"Signal has no amplitude at least {voltage_threshold} V."
+    if AIC_BOOL:
+        envelope = np.abs(hilbert(signal))
+        envelope_max = float(np.max(envelope))
+        if envelope_max == 0:
+            raise ValueError("Signal envelope is zero; onset cannot be detected.")
+        envelope /= envelope_max
+        time_values = np.asarray(time_values, dtype=float)
+        above = np.flatnonzero(
+                                (envelope >= AIC_ENVELOPE_THRESHOLD)
+                                & (time_values >= time_threshold)
+                            )
+        # above = np.flatnonzero(envelope >= AIC_ENVELOPE_THRESHOLD)
+    else:
+        above_mask = np.abs(signal) >= VOLTAGE_THRESHOLD
+        if time_values is None:
+            raise ValueError(
+                "Time values are required when AIC is disabled."
+            )
+        time_values = np.asarray(time_values, dtype=float)
+        if len(time_values) != len(signal):
+            raise ValueError("Signal and time values must have the same length.")
+        above = np.flatnonzero(
+            above_mask & (time_values >= time_threshold)
         )
 
-    threshold_index = int(above[0])
-    if not aic:
+    if len(above) == 0:
+        if AIC_BOOL:
+            raise ValueError(
+                f"Normalized envelope has no value at least "
+                f"{AIC_ENVELOPE_THRESHOLD}."
+            )
+        raise ValueError(
+            f"No sample has |amplitude| >= {VOLTAGE_THRESHOLD} V at or after "
+            f"{time_threshold} s."
+        )
+    return int(above[0])
+
+
+def onset_picker(signal, time_values=None):
+    signal = np.asarray(signal, dtype=float)
+    threshold_index = onset_anchor_index(signal, time_values)
+    if not AIC_BOOL:
         return threshold_index
 
     envelope = np.abs(hilbert(signal))
     envelope_max = float(np.max(envelope))
-    if envelope_max == 0:
-        raise ValueError("Signal envelope is zero; onset cannot be detected.")
     envelope /= envelope_max
 
-    lower = max(threshold_index - 500, 0)
-    upper = min(threshold_index + 500, len(envelope))
+    lower = max(threshold_index - AIC_SEARCH_HALF_WINDOW, 0)
+    upper = min(
+        threshold_index + AIC_SEARCH_HALF_WINDOW,
+        len(envelope),
+    )
     window = envelope[lower:upper]
     if len(window) < 4:
         raise ValueError(
@@ -117,7 +154,10 @@ def onset_picker(signal):
 
 def onset_segment(dataframe, N, context):
     try:
-        onset = onset_picker(dataframe["Amplitude (V)"].to_numpy())
+        onset = onset_picker(
+            dataframe["Amplitude (V)"].to_numpy(),
+            dataframe["Time (s)"].to_numpy(),
+        )
     except ValueError as error:
         log(f"  Skipping {context}: {error}")
         return None
@@ -170,7 +210,7 @@ def process_data(cluster_data, N, time_threshold):
             noise_data[cluster_name][file_name] = [
                 dataframe.loc[noise_mask].copy()
             ]
-            if pulse_detection:
+            if PULSE_DETECTION_BOOL:
                 segment = onset_segment(
                     dataframe,
                     N,
@@ -199,7 +239,7 @@ def process_unlabeled_data(cluster_data, N):
     for cluster_name, file_data in cluster_data.items():
         signal_data[cluster_name] = {}
         for file_name, dataframe in file_data.items():
-            if pulse_detection:
+            if PULSE_DETECTION_BOOL:
                 segment = onset_segment(
                     dataframe,
                     N,
@@ -424,7 +464,7 @@ def plot_spectra(freq_dict, magnitude_dict, method):
         save_current_figure("fft_spectra.png")
 
     elif method == "wavelet":
-        if pulse_detection:
+        if PULSE_DETECTION_BOOL:
             figure_shape = (1, 3)
             figure_size = (15, 4)
             panel_specs = [
@@ -689,9 +729,10 @@ def save_figs(model, y_test, probs, sequences, filekeys, path_default, max_figs=
                 if len(threshold_indices)
                 else None
             )
-        elif pulse_detection:
+        elif PULSE_DETECTION_BOOL:
             try:
-                onset = onset_picker(amplitude_values)
+                anchor = onset_anchor_index(amplitude_values, time_values)
+                onset = onset_picker(amplitude_values, time_values)
             except ValueError as error:
                 log(f"  Cannot mark used segment for {filekeys[i]}: {error}")
                 used_indices = np.array([], dtype=int)
@@ -700,13 +741,12 @@ def save_figs(model, y_test, probs, sequences, filekeys, path_default, max_figs=
             else:
                 used_indices = np.arange(onset, min(onset + N, len(time_values)))
                 marker_time = time_values[onset]
-                threshold_index = np.flatnonzero(
-                    np.abs(amplitude_values) >= 0.02
-                )[0]
-                threshold_marker_time = time_values[threshold_index]
+                threshold_marker_time = time_values[anchor]
             segment_label = "Onset segment used"
             marker_label = (
-                "Detected onset (AIC)" if aic else "Detected onset (|amplitude| >= 0.02 V)"
+                "Detected onset (AIC)"
+                if AIC_BOOL
+                else "Detected onset (|amplitude| >= 0.02 V after time threshold)"
             )
         else:
             used_indices = np.flatnonzero(time_values >= time_threshold)
@@ -736,13 +776,17 @@ def save_figs(model, y_test, probs, sequences, filekeys, path_default, max_figs=
                     linewidth=1.2,
                     label=marker_label,
                 )
-            if y_test[i] != 0 and pulse_detection and threshold_marker_time is not None:
+            if y_test[i] != 0 and PULSE_DETECTION_BOOL and threshold_marker_time is not None:
                 ax.axvline(
                     threshold_marker_time,
                     color="orange",
                     linestyle=":",
                     linewidth=1.2,
-                    label="0.02 V threshold crossing",
+                    label=(
+                        "Envelope >= 20% of max"
+                        if AIC_BOOL
+                        else "0.02 V after time threshold"
+                    ),
                 )
 
         ax.set_xlim(0.0, 0.00005*6)
@@ -862,18 +906,22 @@ def plot_classification_regions(key, model, result_dict, entropy_dict, cluster_d
     label_map = {0: 'Normal (0)', 1: 'Gassing (1)', 2: 'Cracking (2)'}
     used_labels = set()
     
-    if pulse_detection:
+    if PULSE_DETECTION_BOOL:
         cls_id = int(result_dict[0])
-        onset = onset_picker(amp_arr)
-        threshold_index = int(np.flatnonzero(np.abs(amp_arr) >= 0.02)[0])
+        anchor = onset_anchor_index(amp_arr, time_arr)
+        onset = onset_picker(amp_arr, time_arr)
         t_start = time_arr[onset]
         t_end = time_arr[onset + N - 1]
         ax.axvline(
-            time_arr[threshold_index],
+            time_arr[anchor],
             color="orange",
             linestyle=":",
             linewidth=1.2,
-            label="0.02 V threshold crossing",
+            label=(
+                "Envelope >= 20% of max"
+                if AIC_BOOL
+                else "0.02 V after time threshold"
+            ),
         )
         ax.axvline(
             time_arr[onset],
@@ -882,8 +930,8 @@ def plot_classification_regions(key, model, result_dict, entropy_dict, cluster_d
             linewidth=1.2,
             label=(
                 "Detected onset (AIC)"
-                if aic
-                else "Detected onset (|amplitude| >= 0.02 V)"
+                if AIC_BOOL
+                else "Detected onset (|amplitude| >= 0.02 V after time threshold)"
             ),
         )
     else:
@@ -907,7 +955,7 @@ def plot_classification_regions(key, model, result_dict, entropy_dict, cluster_d
     ax.set_ylim(-0.08, 0.08)
     ax.set_xlabel('Time (s)', fontsize=12)
     ax.set_ylabel('Amplitude (V)', fontsize=12)
-    if pulse_detection:
+    if PULSE_DETECTION_BOOL:
         title = f'{key} (Window = {N}, Entropy = {entropy_dict:.3f})'
     else:
         title = (
@@ -1022,7 +1070,7 @@ def main():
     log("[9/9] Classifying 'mixed' cluster")
     result_dict, prob_dict, entropy_dict = classify_segments(models, magnitude_input_dict, keys_dict, 'mixed')
     path_mixed = os.path.join(FIGURE_DIR, 'mixed') 
-    mixed_keys = keys_dict['mixed'] if pulse_detection else [keys_dict['mixed'][9]]
+    mixed_keys = keys_dict['mixed'] if PULSE_DETECTION_BOOL else [keys_dict['mixed'][9]]
     for k in mixed_keys:
         for m in MODEL_LST:
             plot_classification_regions(
