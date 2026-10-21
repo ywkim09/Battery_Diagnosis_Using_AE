@@ -20,6 +20,7 @@ import matplotlib.ticker as ticker
 import numpy as np
 import pandas as pd
 import pywt
+from scipy.signal import hilbert
 from matplotlib.colors import ListedColormap
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 from sklearn.model_selection import train_test_split
@@ -31,6 +32,7 @@ time_threshold = 0.00005
 N = 500
 method = 'wavelet'
 pulse_detection = True
+aic = True
 
 FIGURE_DIR = os.path.join('result', datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')) 
 
@@ -63,12 +65,54 @@ def save_current_figure(name):
 
 def onset_picker(signal):
     voltage_threshold = 0.02
-    onset_indices = np.flatnonzero(np.abs(signal) > voltage_threshold)
-    if len(onset_indices) == 0:
+    signal = np.asarray(signal, dtype=float)
+    above = np.flatnonzero(np.abs(signal) >= voltage_threshold)
+    if len(above) == 0:
         raise ValueError(
-            f"Signal has no amplitude greater than {voltage_threshold} V."
+            f"Signal has no amplitude at least {voltage_threshold} V."
         )
-    return int(onset_indices[0])
+
+    threshold_index = int(above[0])
+    if not aic:
+        return threshold_index
+
+    envelope = np.abs(hilbert(signal))
+    envelope_max = float(np.max(envelope))
+    if envelope_max == 0:
+        raise ValueError("Signal envelope is zero; onset cannot be detected.")
+    envelope /= envelope_max
+
+    lower = max(threshold_index - 500, 0)
+    upper = min(threshold_index + 500, len(envelope))
+    window = envelope[lower:upper]
+    if len(window) < 4:
+        raise ValueError(
+            f"Only {len(window)} samples are available in the AIC window."
+        )
+
+    split_indices = np.arange(2, len(window) - 1)
+    cumulative_sum = np.cumsum(window)
+    cumulative_square_sum = np.cumsum(window**2)
+    left_count = split_indices
+    right_count = len(window) - split_indices
+    left_sum = cumulative_sum[split_indices - 1]
+    right_sum = cumulative_sum[-1] - left_sum
+    left_square_sum = cumulative_square_sum[split_indices - 1]
+    right_square_sum = cumulative_square_sum[-1] - left_square_sum
+    left_ssr = np.maximum(
+        left_square_sum - left_sum**2 / left_count,
+        np.finfo(float).eps,
+    )
+    right_ssr = np.maximum(
+        right_square_sum - right_sum**2 / right_count,
+        np.finfo(float).eps,
+    )
+    aic_scores = (
+        left_count * np.log(left_ssr / left_count)
+        + right_count * np.log(right_ssr / right_count)
+        + 8
+    )
+    return lower + int(split_indices[np.argmin(aic_scores)])
 
 
 def onset_segment(dataframe, N, context):
@@ -652,11 +696,18 @@ def save_figs(model, y_test, probs, sequences, filekeys, path_default, max_figs=
                 log(f"  Cannot mark used segment for {filekeys[i]}: {error}")
                 used_indices = np.array([], dtype=int)
                 marker_time = None
+                threshold_marker_time = None
             else:
                 used_indices = np.arange(onset, min(onset + N, len(time_values)))
                 marker_time = time_values[onset]
+                threshold_index = np.flatnonzero(
+                    np.abs(amplitude_values) >= 0.02
+                )[0]
+                threshold_marker_time = time_values[threshold_index]
             segment_label = "Onset segment used"
-            marker_label = "Detected onset (>0.02 V)"
+            marker_label = (
+                "Detected onset (AIC)" if aic else "Detected onset (|amplitude| >= 0.02 V)"
+            )
         else:
             used_indices = np.flatnonzero(time_values >= time_threshold)
             used_indices = used_indices[:N]
@@ -665,6 +716,7 @@ def save_figs(model, y_test, probs, sequences, filekeys, path_default, max_figs=
             marker_time = (
                 time_values[used_indices[0]] if len(used_indices) else None
             )
+            threshold_marker_time = None
 
         if len(used_indices):
             start_index = int(used_indices[0])
@@ -683,6 +735,14 @@ def save_figs(model, y_test, probs, sequences, filekeys, path_default, max_figs=
                     linestyle="--",
                     linewidth=1.2,
                     label=marker_label,
+                )
+            if y_test[i] != 0 and pulse_detection and threshold_marker_time is not None:
+                ax.axvline(
+                    threshold_marker_time,
+                    color="orange",
+                    linestyle=":",
+                    linewidth=1.2,
+                    label="0.02 V threshold crossing",
                 )
 
         ax.set_xlim(0.0, 0.00005*6)
@@ -805,8 +865,27 @@ def plot_classification_regions(key, model, result_dict, entropy_dict, cluster_d
     if pulse_detection:
         cls_id = int(result_dict[0])
         onset = onset_picker(amp_arr)
+        threshold_index = int(np.flatnonzero(np.abs(amp_arr) >= 0.02)[0])
         t_start = time_arr[onset]
         t_end = time_arr[onset + N - 1]
+        ax.axvline(
+            time_arr[threshold_index],
+            color="orange",
+            linestyle=":",
+            linewidth=1.2,
+            label="0.02 V threshold crossing",
+        )
+        ax.axvline(
+            time_arr[onset],
+            color="blue",
+            linestyle="--",
+            linewidth=1.2,
+            label=(
+                "Detected onset (AIC)"
+                if aic
+                else "Detected onset (|amplitude| >= 0.02 V)"
+            ),
+        )
     else:
         cls_id = int(result_dict[0])
         segment_start = np.flatnonzero(time_arr >= time_threshold)[0]
