@@ -30,6 +30,7 @@ from scipy.stats import entropy
 time_threshold = 0.00005
 N = 500
 method = 'wavelet'
+pulse_detection = False
 
 FIGURE_DIR = os.path.join('result', datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')) 
 
@@ -60,6 +61,11 @@ def save_current_figure(name):
     plt.savefig(os.path.join(FIGURE_DIR, name) , dpi=150)
     plt.close()
 
+def onset_picker(signal):
+    voltage_threshold = 0.02
+    len_signal = len(signal)
+    onset = np.arange(len_signal)[np.array(signal) > voltage_threshold][0]
+    return onset
 
 # ---------------------------------------------------------------------------
 # Data loading / segmentation
