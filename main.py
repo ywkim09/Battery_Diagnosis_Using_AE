@@ -30,7 +30,7 @@ from scipy.stats import entropy
 time_threshold = 0.00005
 N = 500
 method = 'wavelet'
-pulse_detection = False
+pulse_detection = True
 
 FIGURE_DIR = os.path.join('result', datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')) 
 
@@ -63,9 +63,41 @@ def save_current_figure(name):
 
 def onset_picker(signal):
     voltage_threshold = 0.02
-    len_signal = len(signal)
-    onset = np.arange(len_signal)[np.array(signal) > voltage_threshold][0]
-    return onset
+    onset_indices = np.flatnonzero(np.abs(signal) > voltage_threshold)
+    if len(onset_indices) == 0:
+        raise ValueError(
+            f"Signal has no amplitude greater than {voltage_threshold} V."
+        )
+    return int(onset_indices[0])
+
+
+def onset_segment(dataframe, N, context):
+    try:
+        onset = onset_picker(dataframe["Amplitude (V)"].to_numpy())
+    except ValueError as error:
+        log(f"  Skipping {context}: {error}")
+        return None
+
+    segment = dataframe.iloc[onset:onset + N].copy()
+    if len(segment) < N:
+        log(
+            f"  Skipping {context}: only {len(segment)} samples remain after "
+            f"onset; {N} required."
+        )
+        return None
+    return segment
+
+
+def first_segment_after_threshold(dataframe, N, time_threshold, context):
+    signal = dataframe.loc[dataframe["Time (s)"] >= time_threshold]
+    if len(signal) < N:
+        log(
+            f"  Skipping {context}: only {len(signal)} samples remain after "
+            f"time threshold; {N} required."
+        )
+        return None
+    return signal.iloc[:N].copy()
+
 
 # ---------------------------------------------------------------------------
 # Data loading / segmentation
@@ -84,31 +116,36 @@ def load_clusters(folders):
 
 def process_data(cluster_data, N, time_threshold):
     noise_data = {}
-    signal_data = {}
+    signal_data = {"normal": {}}
 
     for cluster_name, file_data in cluster_data.items():
         noise_data[cluster_name] = {}
-        signal_data['normal'] = {}
         signal_data[cluster_name] = {}
         for file_name, dataframe in file_data.items():
-            if cluster_name == 'mixed':
-                signal_data['mixed'][file_name] = []
-                df = dataframe.copy()
-                noise_mask = dataframe["Time (s)"] < time_threshold
-                noise_data[cluster_name][file_name] = [dataframe.loc[noise_mask].copy()]
-                for i in range(len(df)//N):
-                    df_segment = df.iloc[i * N:(i + 1) * N]
-                    signal_data[cluster_name][file_name].append(df_segment)
+            noise_mask = dataframe["Time (s)"] < time_threshold
+            noise_data[cluster_name][file_name] = [
+                dataframe.loc[noise_mask].copy()
+            ]
+            if pulse_detection:
+                segment = onset_segment(
+                    dataframe,
+                    N,
+                    f"{cluster_name}/{file_name}",
+                )
+                if segment is not None:
+                    signal_data[cluster_name][file_name] = [segment]
             else:
-                noise_mask = dataframe["Time (s)"] < time_threshold
-                signal_mask = ((dataframe["Time (s)"] >= time_threshold))
-                noise_data[cluster_name][file_name] = [dataframe.loc[noise_mask].copy()]
-                signal_data['normal'][file_name] = [dataframe.loc[noise_mask].copy()]
-                signal_data[cluster_name][file_name] = []
-                df = dataframe.loc[signal_mask].copy()
-                for i in range(len(df)//N):
-                    df_segment = df.iloc[i * N:(i + 1) * N]
-                    signal_data[cluster_name][file_name].append(df_segment)
+                signal_data["normal"][file_name] = [
+                    dataframe.loc[noise_mask].copy()
+                ]
+                segment = first_segment_after_threshold(
+                    dataframe,
+                    N,
+                    time_threshold,
+                    f"{cluster_name}/{file_name}",
+                )
+                if segment is not None:
+                    signal_data[cluster_name][file_name] = [segment]
     return noise_data, signal_data
 
 
@@ -118,11 +155,23 @@ def process_unlabeled_data(cluster_data, N):
     for cluster_name, file_data in cluster_data.items():
         signal_data[cluster_name] = {}
         for file_name, dataframe in file_data.items():
-            signal_data[cluster_name][file_name] = []
-            df = dataframe.copy()
-            for i in range(len(df)//N):
-                df_segment = df.iloc[i * N:(i + 1) * N]
-                signal_data[cluster_name][file_name].append(df_segment)
+            if pulse_detection:
+                segment = onset_segment(
+                    dataframe,
+                    N,
+                    f"{cluster_name}/{file_name}",
+                )
+                if segment is not None:
+                    signal_data[cluster_name][file_name] = [segment]
+            else:
+                segment = first_segment_after_threshold(
+                    dataframe,
+                    N,
+                    time_threshold,
+                    f"{cluster_name}/{file_name}",
+                )
+                if segment is not None:
+                    signal_data[cluster_name][file_name] = [segment]
     return signal_data
 
 
@@ -331,20 +380,29 @@ def plot_spectra(freq_dict, magnitude_dict, method):
         save_current_figure("fft_spectra.png")
 
     elif method == "wavelet":
+        if pulse_detection:
+            figure_shape = (1, 3)
+            figure_size = (15, 4)
+            panel_specs = [
+                (0, 0, "normal", 0, "Normal", 0, 50),
+                (0, 1, "gassing", 0, "Gassing onset window", 0, 50),
+                (0, 2, "cracking", 0, "Cracking onset window", 0, 50),
+            ]
+        else:
+            figure_shape = (1, 3)
+            figure_size = (15, 4)
+            panel_specs = [
+                (0, 0, "normal", 0, "Normal (0–50 us)", 0, 50),
+                (0, 1, "gassing", 0, "Gassing (0–50 us)", 0, 50),
+                (0, 2, "cracking", 0, "Cracking (0–50 us)", 0, 50),
+            ]
         fig, axes = plt.subplots(
-            2, 3,
-            figsize=(15, 8),
+            *figure_shape,
+            figsize=figure_size,
             sharey=True,
             constrained_layout=True,
+            squeeze=False,
         )
-        # segment 0: 0–50 us, segment 1: 50–100 us
-        panel_specs = [
-            (0, 0, "normal", 0, "Normal (0–50 us)", 0, 50),
-            (0, 1, "gassing", 0, "Gassing (0–50 us)", 0, 50),
-            (0, 2, "cracking", 0, "Cracking (0–50 us)", 0, 50),
-            (1, 1, "gassing", 1, "Gassing (50–100 us)", 50, 100),
-            (1, 2, "cracking", 1, "Cracking (50–100 us)", 50, 100),
-        ]
 
         panels = []
         vmax = 0.0
@@ -382,7 +440,6 @@ def plot_spectra(freq_dict, magnitude_dict, method):
             ax.set_xlabel("Time (us)")
             ax.set_ylabel("Frequency (kHz)")
 
-        axes[1, 0].set_visible(False)
         active_axes = [axes[row, col] for row, col, *_ in panel_specs]
 
         fig.colorbar(
@@ -403,12 +460,6 @@ def compute_p90_point(magnitude_dict):
     for k in magnitude_dict:
         if k != 'mixed':
             image_arr = magnitude_dict[k][:, 0].mean(axis=0)
-            p90 = np.percentile(image_arr, 90)
-            p90_array.append(image_arr > p90)
-
-    for k in magnitude_dict:
-        if k != 'mixed' and k != 'normal':
-            image_arr = magnitude_dict[k][:, 1].mean(axis=0)
             p90 = np.percentile(image_arr, 90)
             p90_array.append(image_arr > p90)
 
@@ -580,8 +631,60 @@ def save_figs(model, y_test, probs, sequences, filekeys, path_default, max_figs=
             
         label = f"True Class: {AR_CLASS_NAMES[y_test[i]]}, Predicted: {AR_CLASS_NAMES[test_result[i]]}"
         
-        # 2. plt.plot 대신 ax.plot을 사용하여 이 축에만 선을 그립니다.
-        ax.plot(sequences[i]['Time (s)'].values, sequences[i]['Amplitude (V)'].values, label=label, color=color)
+        time_values = sequences[i]['Time (s)'].to_numpy()
+        amplitude_values = sequences[i]['Amplitude (V)'].to_numpy()
+        ax.plot(time_values, amplitude_values, label=label, color=color)
+
+        if y_test[i] == 0:
+            used_indices = np.flatnonzero(time_values < time_threshold)
+            segment_label = "Noise segment used"
+            marker_label = "Noise/signal boundary"
+            threshold_indices = np.flatnonzero(time_values >= time_threshold)
+            marker_time = (
+                time_values[threshold_indices[0]]
+                if len(threshold_indices)
+                else None
+            )
+        elif pulse_detection:
+            try:
+                onset = onset_picker(amplitude_values)
+            except ValueError as error:
+                log(f"  Cannot mark used segment for {filekeys[i]}: {error}")
+                used_indices = np.array([], dtype=int)
+                marker_time = None
+            else:
+                used_indices = np.arange(onset, min(onset + N, len(time_values)))
+                marker_time = time_values[onset]
+            segment_label = "Onset segment used"
+            marker_label = "Detected onset (>0.02 V)"
+        else:
+            used_indices = np.flatnonzero(time_values >= time_threshold)
+            used_indices = used_indices[:N]
+            segment_label = "First post-threshold segment used"
+            marker_label = "Time threshold"
+            marker_time = (
+                time_values[used_indices[0]] if len(used_indices) else None
+            )
+
+        if len(used_indices):
+            start_index = int(used_indices[0])
+            end_index = int(used_indices[-1])
+            ax.axvspan(
+                time_values[start_index],
+                time_values[end_index],
+                color="gold",
+                alpha=0.3,
+                label=segment_label,
+            )
+            if marker_time is not None:
+                ax.axvline(
+                    marker_time,
+                    color="blue",
+                    linestyle="--",
+                    linewidth=1.2,
+                    label=marker_label,
+                )
+
         ax.set_xlim(0.0, 0.00005*6)
         ax.set_ylim(-0.08, 0.08)
         ax.grid(True)
@@ -699,10 +802,16 @@ def plot_classification_regions(key, model, result_dict, entropy_dict, cluster_d
     label_map = {0: 'Normal (0)', 1: 'Gassing (1)', 2: 'Cracking (2)'}
     used_labels = set()
     
-    cls_id = result_dict[1]
-
-    t_start = time_arr[N]
-    t_end = time_arr[N + N - 1] 
+    if pulse_detection:
+        cls_id = int(result_dict[0])
+        onset = onset_picker(amp_arr)
+        t_start = time_arr[onset]
+        t_end = time_arr[onset + N - 1]
+    else:
+        cls_id = int(result_dict[0])
+        segment_start = np.flatnonzero(time_arr >= time_threshold)[0]
+        t_start = time_arr[segment_start]
+        t_end = time_arr[segment_start + N - 1]
 
     color = color_map.get(cls_id, 'gray')
     label = label_map.get(cls_id, f'Class {cls_id}') if cls_id not in used_labels else None
@@ -719,12 +828,19 @@ def plot_classification_regions(key, model, result_dict, entropy_dict, cluster_d
     ax.set_ylim(-0.08, 0.08)
     ax.set_xlabel('Time (s)', fontsize=12)
     ax.set_ylabel('Amplitude (V)', fontsize=12)
-    ax.set_title(f'{key} (Window = {N}, Strid = {N}, Entropy = {entropy_dict:.3f}', fontsize=14)
+    if pulse_detection:
+        title = f'{key} (Window = {N}, Entropy = {entropy_dict:.3f})'
+    else:
+        title = (
+            f'{key} (Window = {N}, Strid = {N}, '
+            f'Entropy = {entropy_dict:.3f}'
+        )
+    ax.set_title(title, fontsize=14)
     ax.grid(True, linestyle='--', alpha=0.5)
     ax.legend(handles=handles, loc='upper right')
     # ax.legend(loc='upper right')
     if save:   
-        path_dir = os.path.join(path, model, str(result_dict[1])) 
+        path_dir = os.path.join(path, model, str(cls_id))
         os.makedirs(path_dir, exist_ok=True)
         file_path = os.path.join(path_dir, key + ".png")
         plt.savefig(file_path)
@@ -801,7 +917,7 @@ def main():
 
     # ARMA model
     log(f"[6/9] Training AR({AR_ORDER}) model")
-    path_test = os.path.join(FIGURE_DIR, 'test') 
+    path_test = os.path.join(FIGURE_DIR, 'dataset-test') 
     ar_y_test, ar_log_likelihoods, test_sequences, test_filekeys, full_sequences = run_ar_model(
         signal_data, cluster_data, sample_key_to_index, train_idx, valid_idx, test_idx
     )
@@ -826,10 +942,20 @@ def main():
     # Mixed cluster
     log("[9/9] Classifying 'mixed' cluster")
     result_dict, prob_dict, entropy_dict = classify_segments(models, magnitude_input_dict, keys_dict, 'mixed')
-    k = keys_dict['mixed'][9]
     path_mixed = os.path.join(FIGURE_DIR, 'mixed') 
-    for m in MODEL_LST:
-        plot_classification_regions(k, m, result_dict[m][k], entropy_dict[m][k], cluster_data["mixed"][k], path_mixed, N, save = True)
+    mixed_keys = keys_dict['mixed'] if pulse_detection else [keys_dict['mixed'][9]]
+    for k in mixed_keys:
+        for m in MODEL_LST:
+            plot_classification_regions(
+                k,
+                m,
+                result_dict[m][k],
+                entropy_dict[m][k],
+                cluster_data["mixed"][k],
+                path_mixed,
+                N,
+                save=True,
+            )
 
     # -----------------------------------------------------------------------
     # Unlabeled test data
@@ -847,7 +973,7 @@ def main():
 
     test_keys = keys_dict['test']
     log(f"[Unlabeled 4/4] Saving classification plots for {len(test_keys)} files")
-    path_drift = os.path.join(FIGURE_DIR, 'drift') 
+    path_drift = os.path.join(FIGURE_DIR, 'dataset-new') 
     for idx, k in enumerate(test_keys, 1):
         if idx % 50 == 0 or idx == len(test_keys):
             log(f"  {idx}/{len(test_keys)} files plotted")
