@@ -778,12 +778,12 @@ def main():
         stratify=y,
     )
 
-    # 2단계: Train+Valid에서 Train과 Valid 분리
+    # Train+Valid Train Valid
     train_idx, valid_idx = train_test_split(
         train_valid_idx,
         test_size=0.20,
         random_state=42,
-        stratify=y[train_valid_idx],  # ★ 핵심: train_valid_idx에 해당하는 y만 슬라이싱하여 전달
+        stratify=y[train_valid_idx],  # y of train_valid_idx
     )
 
     # 최종 데이터 및 타겟 분할
