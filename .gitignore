@@ -27,7 +27,7 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
-mini_env/
+bat_ae/
 result/
 # PyInstaller
 #   Usually these files are written by a python script from a template
