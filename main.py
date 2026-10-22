@@ -980,19 +980,19 @@ def main():
     # -----------------------------------------------------------------------
     # Training of model
     # -----------------------------------------------------------------------
-    log("[1/9] Loading labeled clusters")
+    log("[1/10] Loading labeled clusters")
     cluster_data = load_clusters(cluster_folders)
-    log("[2/9] Splitting into noise / signal segments")
+    log("[2/10] Splitting into noise / signal segments")
     noise_data, signal_data = process_data(cluster_data, N, time_threshold)
 
-    log("[3/9] Plotting noise figures")
+    log("[3/10] Plotting noise figures")
     plot_noise_moving_average(noise_data)
     plot_noise_signals(noise_data)
     plot_noise_mean_std(noise_data)
 
     signal_data["normal"] = noise_data["cracking"]#| noise_data["mixed"]
 
-    log(f"[4/9] Running {method} transform on labeled data")
+    log(f"[4/10] Running {method} transform on labeled data")
     keys_dict, freq_dict, magnitude_dict = transform_all(signal_data, method)
     log("  Plotting spectra")
     plot_spectra(freq_dict, magnitude_dict, method)
@@ -1004,7 +1004,7 @@ def main():
         plot_p90_mask(p90_point, N)
     magnitude_input_dict = select_features(magnitude_dict, method, p90_point)
 
-    log("[5/9] Building train/test split")
+    log("[5/10] Building train/test split")
     confirmed_classes = [key for key in signal_data if key.split('_')[0] != 'mixed' and key.split('_')[-1] != 'decay']
     print("Confirmed classes:", confirmed_classes)
     X = np.vstack([magnitude_input_dict[key][:,0,:] for key in confirmed_classes])
@@ -1043,7 +1043,7 @@ def main():
     print(f"Test set size: {X_test.shape[0]}")
 
     # ARMA model
-    log(f"[6/9] Training AR({AR_ORDER}) model")
+    log(f"[6/10] Training AR({AR_ORDER}) model")
     path_test = os.path.join(FIGURE_DIR, 'dataset-test') 
     ar_y_test, ar_log_likelihoods, test_sequences, test_filekeys, full_sequences = run_ar_model(
         signal_data, cluster_data, sample_key_to_index, train_idx, valid_idx, test_idx
@@ -1051,12 +1051,12 @@ def main():
     save_figs('ARMA', ar_y_test, ar_log_likelihoods, full_sequences, test_filekeys, path_test)
 
     # Gaussian NB
-    log("[7/9] Training Gaussian NB")
+    log("[7/10] Training Gaussian NB")
     model = train_gaussian_nb(X_train, y_train, X_test, y_test, confirmed_classes, y, sample_keys, train_idx, test_idx)
     save_figs('GNB', y_test, model.predict_proba(X_test), full_sequences, test_filekeys, path_test)
 
     # XGBoost
-    log("[8/9] Training XGBoost")
+    log("[8/10] Training XGBoost")
     xgb_model = train_xgboost(X_train, y_train, X_valid, y_valid, X_test, y_test, confirmed_classes)
     save_figs('XGB', y_test, xgb_model.predict_proba(X_test), full_sequences, test_filekeys, path_test)
 
@@ -1067,7 +1067,7 @@ def main():
 
 
     # Mixed cluster
-    log("[9/9] Classifying 'mixed' cluster")
+    log("[9/10] Classifying 'mixed' cluster")
     result_dict, prob_dict, entropy_dict = classify_segments(models, magnitude_input_dict, keys_dict, 'mixed')
     path_mixed = os.path.join(FIGURE_DIR, 'mixed') 
     mixed_keys = keys_dict['mixed'] if PULSE_DETECTION_BOOL else [keys_dict['mixed'][9]]
