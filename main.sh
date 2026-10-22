@@ -14,7 +14,7 @@ mkdir -p logs
 # 1. 필요한 모듈 로드
 module load Miniconda3/25.7.0-2
 source $(conda info --base)/etc/profile.d/conda.sh
-conda activate ./mini_env
+conda activate ./bat_ae
 # 2. 작업 제출 디렉토리로 이동
 cd $SLURM_SUBMIT_DIR
 
