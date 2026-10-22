@@ -872,8 +872,13 @@ def train_xgboost(X_train, y_train, X_valid, y_valid, X_test, y_test, confirmed_
 
 
 # ---------------------------------------------------------------------------
-# SHAP analysis (XGBoost)
+# SHAP analysis (GaussNB / XGBoost, FFT or wavelet features)
 # ---------------------------------------------------------------------------
+# Both models produce class probabilities as softmax(margin), so SHAP values are
+# computed in margin space: log-odds for XGBoost, log joint likelihood for GaussNB.
+SHAP_UNITS = {"XGBoost": "log-odds", "GaussNB": "log-likelihood"}
+
+
 def compute_xgb_shap(xgb_model, X):
     """Exact TreeSHAP via XGBoost's native pred_contribs (log-odds space).
 
@@ -892,6 +897,41 @@ def compute_xgb_shap(xgb_model, X):
     return contribs[:, :-1, :], contribs[:, -1, :]
 
 
+def compute_gnb_shap(gnb_model, X, background):
+    """Exact SHAP for Gaussian NB in log-joint-likelihood space.
+
+    The log joint log P(c) + sum_f log N(x_f | theta_cf, var_cf) is additive over
+    features, so the (interventional) SHAP value of feature f is its log-density
+    term minus that term's expectation over the background data.
+    Returns the same shapes as compute_xgb_shap.
+    """
+    theta, var = gnb_model.theta_.T, gnb_model.var_.T  # (F, C)
+    X = np.asarray(X, dtype=float)
+    background = np.asarray(background, dtype=float)
+
+    log_norm = np.log(2 * np.pi * var)
+    log_density = -0.5 * (log_norm + (X[:, :, None] - theta) ** 2 / var)  # (n, F, C)
+
+    # E_bg[(z - theta)^2] = Var_bg(z) + (mean_bg(z) - theta)^2, avoids an (n_bg, F, C) array
+    bg_mean = background.mean(axis=0)[:, None]
+    bg_var = background.var(axis=0)[:, None]
+    expected_log_density = -0.5 * (log_norm + (bg_var + (bg_mean - theta) ** 2) / var)  # (F, C)
+
+    shap_values = log_density - expected_log_density
+    base_values = np.log(gnb_model.class_prior_) + expected_log_density.sum(axis=0)
+    return shap_values, np.tile(base_values, (len(X), 1))
+
+
+def compute_shap(model, X, background=None):
+    if isinstance(model, XGBClassifier):
+        return compute_xgb_shap(model, X)
+    if isinstance(model, GaussianNB):
+        if background is None:
+            raise ValueError("GaussNB SHAP needs background data (e.g. X_train)")
+        return compute_gnb_shap(model, X, background)
+    raise TypeError(f"SHAP not supported for {type(model).__name__}")
+
+
 def shap_to_tf_grid(values, p90_point):
     """Scatter per-feature values back onto the (frequency, time) scalogram grid."""
     grid = np.full(p90_point.shape, np.nan)
@@ -899,23 +939,29 @@ def shap_to_tf_grid(values, p90_point):
     return grid
 
 
-def run_shap_analysis(xgb_model, X, y, confirmed_classes, p90_point, frequency, out_dir,
-                      time_us=None, top_k=20):
+def run_shap_analysis(model, model_name, X, y, confirmed_classes, p90_point, frequency, out_dir,
+                      background=None, time_us=None, top_k=20):
+    """SHAP figures for one model.
+
+    p90_point=None means FFT features (one per frequency bin); otherwise the
+    features are the scalogram pixels selected by the P90 mask (wavelet).
+    """
     os.makedirs(out_dir, exist_ok=True)
-    shap_values, base_values = compute_xgb_shap(xgb_model, X)
+    shap_values, base_values = compute_shap(model, X, background)
     n_classes = shap_values.shape[2]
     class_names = list(confirmed_classes)[:n_classes]
+    unit = SHAP_UNITS.get(model_name, "margin")
 
-    # Sanity check: SHAP values + base must reproduce the model margin
-    probs = xgb_model.predict_proba(X)
+    # Sanity check: SHAP values + base must reproduce predict_proba via softmax
+    probs = model.predict_proba(X)
     margin = shap_values.sum(axis=1) + base_values
     softmax = np.exp(margin - margin.max(axis=1, keepdims=True))
     softmax /= softmax.sum(axis=1, keepdims=True)
     if n_classes > 1 and not np.allclose(softmax, probs, atol=1e-4):
-        log("  WARNING: SHAP additivity check failed (max diff "
+        log(f"  WARNING: {model_name} SHAP additivity check failed (max diff "
             f"{np.abs(softmax - probs).max():.2e})")
 
-    # Feature names: frequency/time of each selected scalogram pixel
+    # Feature names: frequency (FFT) or frequency/time of each selected scalogram pixel (wavelet)
     if p90_point is not None:
         if time_us is None:
             time_us = np.linspace(0, 250, p90_point.shape[1])
@@ -923,6 +969,8 @@ def run_shap_analysis(xgb_model, X, y, confirmed_classes, p90_point, frequency, 
         feature_names = [f"{frequency[f]:.0f} kHz, {time_us[t]:.1f} us" for f, t in zip(f_idx, t_idx)]
     else:
         feature_names = [f"{f:.0f} kHz" for f in frequency]
+    if len(feature_names) != X.shape[1]:
+        raise ValueError(f"{len(feature_names)} feature names for {X.shape[1]} features")
 
     np.savez_compressed(
         os.path.join(out_dir, "shap_values.npz"),
@@ -933,15 +981,15 @@ def run_shap_analysis(xgb_model, X, y, confirmed_classes, p90_point, frequency, 
     # 1. Global importance: mean |SHAP| per feature, stacked by class
     mean_abs = np.abs(shap_values).mean(axis=0)  # (F, C)
     order = np.argsort(mean_abs.sum(axis=1))[::-1][:top_k][::-1]
-    fig, ax = plt.subplots(figsize=(8, 0.35 * top_k + 1.5))
+    fig, ax = plt.subplots(figsize=(8, 0.35 * len(order) + 1.5))
     left = np.zeros(len(order))
     for c in range(n_classes):
         ax.barh(np.arange(len(order)), mean_abs[order, c], left=left, label=class_names[c])
         left += mean_abs[order, c]
     ax.set_yticks(np.arange(len(order)))
     ax.set_yticklabels([feature_names[i] for i in order])
-    ax.set_xlabel("mean(|SHAP value|)  [log-odds]")
-    ax.set_title(f"XGBoost global feature importance (top {top_k})")
+    ax.set_xlabel(f"mean(|SHAP value|)  [{unit}]")
+    ax.set_title(f"{model_name} global feature importance (top {len(order)})")
     ax.legend(loc="lower right")
     fig.tight_layout()
     fig.savefig(os.path.join(out_dir, "shap_global_importance.png"), dpi=150)
@@ -956,16 +1004,38 @@ def run_shap_analysis(xgb_model, X, y, confirmed_classes, p90_point, frequency, 
             feature_names=feature_names,
         )
         shap.plots.beeswarm(explanation, max_display=top_k, show=False)
-        plt.title(f"SHAP beeswarm - class '{name}'")
+        plt.title(f"{model_name} SHAP beeswarm - class '{name}'")
         plt.tight_layout()
         plt.savefig(os.path.join(out_dir, f"shap_beeswarm_{name}.png"), dpi=150)
         plt.close("all")
 
-    # 3. Time-frequency maps (wavelet features only)
-    if p90_point is not None:
+    # Signed mean SHAP for the true class: > 0 pushes toward that class, < 0 against
+    signed_true = np.stack([
+        shap_values[y == c, :, c].mean(axis=0) if (y == c).any() else np.zeros(shap_values.shape[1])
+        for c in range(n_classes)
+    ], axis=1)  # (F, C)
+
+    # 3a. FFT features: SHAP profile along the frequency axis
+    if p90_point is None:
+        fig, axes = plt.subplots(2, 1, figsize=(9, 6), sharex=True, constrained_layout=True)
+        for c in range(n_classes):
+            axes[0].plot(frequency, mean_abs[:, c], label=class_names[c])
+            axes[1].plot(frequency, signed_true[:, c], label=f"{class_names[c]} samples")
+        axes[0].set_ylabel(f"mean |SHAP| [{unit}]")
+        axes[0].set_title(f"{model_name}: where in the spectrum the model looks")
+        axes[1].axhline(0, color="black", linewidth=0.6)
+        axes[1].set_ylabel(f"mean SHAP toward true class [{unit}]")
+        axes[1].set_xlabel("Frequency (kHz)")
+        for ax in axes:
+            ax.legend()
+        fig.savefig(os.path.join(out_dir, "shap_spectrum.png"), dpi=150)
+        plt.close(fig)
+
+    # 3b. Wavelet features: time-frequency maps
+    else:
         extent = [time_us[0], time_us[-1], frequency[0], frequency[-1]]
 
-        # 3a. mean |SHAP| per class over all samples: where the model looks
+        # mean |SHAP| per class over all samples: where the model looks
         grids = [shap_to_tf_grid(mean_abs[:, c], p90_point) for c in range(n_classes)]
         vmax = np.nanmax(grids)
         fig, axes = plt.subplots(1, n_classes, figsize=(5 * n_classes, 4), sharey=True,
@@ -977,16 +1047,13 @@ def run_shap_analysis(xgb_model, X, y, confirmed_classes, p90_point, frequency, 
             ax.set_xlabel(r"Time ($\mu s$)")
             ax.set_ylim([0, 2000])
         axes[0, 0].set_ylabel("Frequency (kHz)")
-        fig.colorbar(im, ax=axes[0].tolist(), label="mean |SHAP| [log-odds]")
+        fig.colorbar(im, ax=axes[0].tolist(), label=f"mean |SHAP| [{unit}]")
+        fig.suptitle(model_name)
         fig.savefig(os.path.join(out_dir, "shap_tf_mean_abs.png"), dpi=150)
         plt.close(fig)
 
-        # 3b. signed mean SHAP for the true class: red pushes toward, blue against
-        grids = []
-        for c in range(n_classes):
-            mask = y == c
-            vals = shap_values[mask, :, c].mean(axis=0) if mask.any() else np.zeros(shap_values.shape[1])
-            grids.append(shap_to_tf_grid(vals, p90_point))
+        # signed mean SHAP for the true class: red pushes toward, blue against
+        grids = [shap_to_tf_grid(signed_true[:, c], p90_point) for c in range(n_classes)]
         vlim = np.nanmax(np.abs(grids))
         fig, axes = plt.subplots(1, n_classes, figsize=(5 * n_classes, 4), sharey=True,
                                  constrained_layout=True, squeeze=False)
@@ -997,7 +1064,8 @@ def run_shap_analysis(xgb_model, X, y, confirmed_classes, p90_point, frequency, 
             ax.set_xlabel(r"Time ($\mu s$)")
             ax.set_ylim([0, 2000])
         axes[0, 0].set_ylabel("Frequency (kHz)")
-        fig.colorbar(im, ax=axes[0].tolist(), label="mean SHAP [log-odds]")
+        fig.colorbar(im, ax=axes[0].tolist(), label=f"mean SHAP [{unit}]")
+        fig.suptitle(model_name)
         fig.savefig(os.path.join(out_dir, "shap_tf_signed_true_class.png"), dpi=150)
         plt.close(fig)
 
@@ -1194,19 +1262,21 @@ def main():
     xgb_model = train_xgboost(X_train, y_train, X_valid, y_valid, X_test, y_test, confirmed_classes)
     save_figs('XGB', y_test, xgb_model.predict_proba(X_test), full_sequences, test_filekeys, path_test)
 
-    log("[9/10]  SHAP analysis for XGBoost (test set)")
-    frequency = np.asarray(freq_dict[confirmed_classes[0]])[:, 0, :].mean(axis=0)
-    run_shap_analysis(xgb_model, X_test, y_test, confirmed_classes, p90_point, frequency,
-                      os.path.join(FIGURE_DIR, 'shap'))
-
     models = {"GaussNB": model, "XGBoost": xgb_model}
+
+    log(f"[9/10] SHAP analysis for {', '.join(MODEL_LST)} on {method} features (test set)")
+    frequency = np.asarray(freq_dict[confirmed_classes[0]])[:, 0, :].mean(axis=0)
+    for m in MODEL_LST:
+        log(f"  {m}")
+        run_shap_analysis(models[m], m, X_test, y_test, confirmed_classes, p90_point, frequency,
+                          os.path.join(FIGURE_DIR, 'shap', f"{m}_{method}"), background=X_train)
     path_model = os.path.join(FIGURE_DIR, 'models', 'data.pkl') 
     os.makedirs(os.path.dirname(path_model), exist_ok=True)
     pickle.dump(models, open(path_model, 'wb'))
 
 
     # Mixed cluster
-    log("[9/10] Classifying 'mixed' cluster")
+    log("[10/10] Classifying 'mixed' cluster")
     result_dict, prob_dict, entropy_dict = classify_segments(models, magnitude_input_dict, keys_dict, 'mixed')
     path_mixed = os.path.join(FIGURE_DIR, 'mixed') 
     mixed_keys = keys_dict['mixed'] if PULSE_DETECTION_BOOL else [keys_dict['mixed'][9]]
